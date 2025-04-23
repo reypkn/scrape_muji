@@ -1,42 +1,50 @@
 import time
 import csv
+import os
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, WebDriverException
 from datetime import datetime
 
 
 def close_popup(driver):
     """Close the subscription popup on the page."""
     try:
-        close_button = WebDriverWait(driver, 5).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "span.subbox-close"))
-        )
-        close_button.click()
-    except Exception as e:
-        print("Popup not found or already closed:", e)
-    
+        popup_locator = (By.CSS_SELECTOR, "span.subbox-close")
+        if WebDriverWait(driver, 10).until(EC.presence_of_element_located(popup_locator)):  # Wait 10 seconds for popup
+            close_button = driver.find_element(*popup_locator)
+            close_button.click()
+    except TimeoutException:
+        print("Popup not found or already closed.")
 
-def load_all_products(driver):
-    """Click the 'Load more products' button until all products are displayed."""
-    while True:
-        try:
-            load_more_button = WebDriverWait(driver, 5).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "button[rel='next']"))
-            )
-            load_more_button.click()
-            time.sleep(2)  # Allow products to load
-        except Exception:
-            print("No more products to load.")
-            break
+
+def load_more_products(driver, page_count, wait_time=20):
+    """Click the 'Load more products' button to load more items."""
+    print(f"Attempting to load page {page_count + 1}...")
+    try:
+        print("Waiting for 'Load more products' button...")
+        load_more_button = WebDriverWait(driver, wait_time).until(
+            EC.element_to_be_clickable((By.CSS_SELECTOR, "button[rel='next']"))
+        )
+        print("Clicking 'Load more products' button...")
+        driver.execute_script("arguments[0].scrollIntoView(true);", load_more_button)
+        driver.execute_script("arguments[0].click();", load_more_button)
+        time.sleep(2)  # Allow new products to load
+        print(f"Successfully loaded page {page_count + 1}.")
+        return True
+    except TimeoutException:
+        print("Failed to click 'Load more products' button or button not found.")
+        return False
 
 
 def get_product_links(driver):
     """Retrieve all product links from the main page."""
     product_elements = driver.find_elements(By.CSS_SELECTOR, "a.list-product-gallery")
     product_links = [product.get_attribute("href") for product in product_elements]
+    print(f"Total product links found: {len(product_links)}")
     return product_links
 
 
@@ -85,28 +93,58 @@ def scrape_product_details(driver, url):
     except Exception:
         product_data['image'] = None
 
+    product_data['url'] = url  # Add the product URL for tracking
     return product_data
 
 
-def save_to_csv(data, country, product_type):
+def save_to_csv(data, filename):
     """Save scraped data to a CSV file."""
-    date_str = datetime.now().strftime("%Y%m%d")
-    filename = f"{date_str}_{country}_{product_type}.csv"
+    file_exists = os.path.isfile(filename)
 
-    with open(filename, mode='w', newline='', encoding='utf-8') as file:
-        writer = csv.DictWriter(file, fieldnames=["name", "price", "color", "size", "description", "image"])
-        writer.writeheader()
+    with open(filename, mode='a', newline='', encoding='utf-8') as file:
+        writer = csv.DictWriter(file, fieldnames=["name", "price", "color", "size", "description", "image", "url"])
+        if not file_exists:
+            writer.writeheader()  # Write header only if file does not exist
         writer.writerows(data)
 
     print(f"Data saved to {filename}")
 
 
+def load_existing_urls(filename):
+    """Load existing product URLs from the CSV file."""
+    if not os.path.isfile(filename):
+        return set()
+
+    with open(filename, mode='r', encoding='utf-8') as file:
+        reader = csv.DictReader(file)
+        return {row['url'] for row in reader}
+
+
+def reopen_browser(service, options, url):
+    """Close and reopen the browser, then return the new driver."""
+    print("Reopening the browser...")
+    driver = webdriver.Chrome(service=service, options=options)
+    driver.get(url)
+    time.sleep(3)  # Allow the page to load
+    close_popup(driver)
+    return driver
+
+
 def scrape_muji_products(country, product_type, url):
     """Main function to scrape products data."""
-    # Use the Service class to specify the path to chromedriver
     service = Service("/usr/local/bin/chromedriver")
     options = webdriver.ChromeOptions()
-    options.add_argument("--headless")  # Run the browser in headless mode
+
+    # Enable headless mode and optimize resource usage
+    options.add_argument("--headless")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--no-sandbox")
+
+    filename = f"{datetime.now().strftime('%Y%m%d')}_{country}_{product_type}.csv"
+    scraped_urls = load_existing_urls(filename)
+    page_count = 0  # Initialize page count
+
     driver = webdriver.Chrome(service=service, options=options)
 
     try:
@@ -114,23 +152,64 @@ def scrape_muji_products(country, product_type, url):
         time.sleep(3)  # Allow the page to load
 
         close_popup(driver)
-        load_all_products(driver)
 
-        product_links = get_product_links(driver)
-        print(f"Found {len(product_links)} products.")
+        while True:
+            print(f"Working on page {page_count + 1}...")
 
-        all_products = []
-        for link in product_links:
-            product_details = scrape_product_details(driver, link)
-            all_products.append(product_details)
+            # Get product links
+            product_links = get_product_links(driver)
+            new_products = [link for link in product_links if link not in scraped_urls]
+            print(f"Found {len(new_products)} new products to scrape.")
 
-        save_to_csv(all_products, country, product_type)
+            page_scraped = False  # Flag to track if current page was scraped
+
+            if not new_products:
+                print("No new products found on this page. Checking if there are more pages...")
+                if not load_more_products(driver, page_count, wait_time=20):
+                    print("No more pages to load. Exiting.")
+                    break
+                page_count += 1
+                continue
+
+            # Scrape new product details
+            all_products = []
+            for idx, link in enumerate(new_products):
+                print(f"Scraping product {idx + 1}/{len(new_products)}: {link}")
+                product_details = scrape_product_details(driver, link)
+                all_products.append(product_details)
+                scraped_urls.add(link)  # Add to the set of scraped URLs
+
+            # Save scraped data
+            save_to_csv(all_products, filename)
+            page_scraped = True  # Mark the page as scraped
+
+            # Close and reopen browser if the page was scraped
+            if page_scraped:
+                driver.quit()  # Close the browser
+                driver = reopen_browser(service, options, url)  # Reopen the browser
+                # Navigate back to the last page
+                for _ in range(page_count):
+                    if not load_more_products(driver, page_count, wait_time=20):
+                        print("Failed to navigate to the correct page after reopening the browser.")
+                        break
+
+            # Try to load the next page
+            if not load_more_products(driver, page_count, wait_time=20):
+                print("No more pages to load. Exiting.")
+                break
+            page_count += 1
+
+    except WebDriverException as e:
+        print(f"Browser error occurred: {e}. Restarting browser...")
+        driver.quit()
+        driver = reopen_browser(service, options, url)
+        scrape_muji_products(country, product_type, url)  # Resume scraping
 
     finally:
         driver.quit()
 
 
-# Start scraping for UAE stationery products
+# Start scraping
 if __name__ == "__main__":
     scrape_muji_products(
         country="uae",
